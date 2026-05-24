@@ -1,0 +1,72 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Data files
+*.csv
+*.parquet
+*.feather
+*.pkl
+*.mat
+*.rds
+*.sav
+*.h5
+*.hdf5
+*.npy
+*.npy
+*.joblib
+
+# Figures / reports
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.gif
+*.pdf
+
+# Logs / temp / R history
+logs/
+*.log
+*.tmp
+*.save
+.Rhistory
+output_down.txt
+output_up.txt
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.ruff_cache/
+.tox/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# python/data — keep directory structure via .gitkeep, ignore all data files
+python/data/raw/**
+python/data/daily/**
+python/data/output/**
+!**/.gitkeep

@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "parafac-traffic"
+version = "0.1.0"
+description = "PARAFAC decomposition of network traffic tensors"
+authors = [{name = "Ananda Streit", email = "ananda@streit.com.br"}]
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pandas<2.0.0",
+    "tensorly",
+    "scipy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=23.0",
+    "isort>=5.12",
+    "flake8>=6.0",
+    "pylint>=2.17",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.pylint.messages_control]
+disable = [
+    "C0103",  # Invalid name (X, y, etc. are standard in ML/scientific code)
+    "C0114", "C0115", "C0116",  # Missing docstrings
+    "R0912", "R0913", "R0914", "R0915",  # Complexity (scientific algorithms)
+    "R0801",  # Duplicate code (tensor operations have similar patterns)
+]
+
+[tool.pylint.format]
+max-line-length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_functions = "test_*"
+addopts = "-v --tb=short"
