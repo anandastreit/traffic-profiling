@@ -30,7 +30,7 @@ import glob
 import numpy as np
 import pandas as pd
 import tensorly as tl
-from tensorly.decomposition import non_negative_parafac_hals
+from tensorly.decomposition import non_negative_parafac
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -140,25 +140,23 @@ def build_week_tensor(ids_down: pd.DataFrame, data_down: np.ndarray,
 def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
                 tol: float = TOLERANCE, seed: int = SEED):
     """
-    Non-negative PARAFAC decomposition.
+    Non-negative PARAFAC decomposition — mirrors MATLAB parafac() with const=[2,2,2,2].
 
-    Equivalent to MATLAB:
-        rng(123,'twister');
-        parafac(X, NUM_COMP, Options, const)
-    with Options(1)=tol, Options(3)=0 (no plots), Options(4)=1 (default scaling)
-    and const=[2 2 2 2] (non-negativity on all modes).
-
-    NOTE on NaN handling: MATLAB's N-way toolbox skips NaN entries during ALS
-    updates. Here we replace NaN with 0 before decomposition, which is a
-    simplification. Validate against MATLAB outputs to assess impact.
+    NaN entries (missing user/day combinations) are excluded from ALS updates via a
+    boolean mask, matching MATLAB's N-way toolbox behavior of skipping NaN cells.
+    The tensor is filled with 0 so tensorly can operate on it, but those positions
+    are masked out and do not influence the factor updates.
     """
+    nan_mask = np.isnan(X)
     tensor = tl.tensor(np.nan_to_num(X, nan=0.0))
-    cp = non_negative_parafac_hals(
+    mask = tl.tensor(~nan_mask) if nan_mask.any() else None
+    cp = non_negative_parafac(
         tensor,
         rank=n_components,
         n_iter_max=10000,
         tol=tol,
         random_state=seed,
+        mask=mask,
         verbose=False,
     )
     return cp
