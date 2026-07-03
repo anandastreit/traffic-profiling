@@ -36,12 +36,19 @@ import pandas as pd
 import tensorly as tl
 from tensorly.decomposition import non_negative_parafac
 
+try:
+    import torch
+    tl.set_backend("pytorch")
+    torch.set_num_threads(torch.get_num_threads())
+except ImportError:
+    pass  # fall back to numpy backend
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 NUM_COMP = 3
-TOLERANCE = 1e-10
+TOLERANCE = 1e-8
 SEED = 123
 NUM_MINUTES = 1440
 
@@ -141,7 +148,10 @@ def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
     """
     nan_mask = np.isnan(X)
     tensor = tl.tensor(np.nan_to_num(X, nan=0.0))
-    mask = tl.tensor(~nan_mask) if nan_mask.any() else None
+    # Cast mask to float — PyTorch does not support arithmetic on bool tensors
+    mask = tl.tensor((~nan_mask).astype(float)) if nan_mask.any() else None
+    # SVD init tries to compute full SVD of the mode-2 unfolding (shape 2 × n_ud*1440),
+    # which requires a (n_ud*1440 × n_ud*1440) matrix — infeasible on real data.
     return non_negative_parafac(
         tensor,
         rank=n_components,
@@ -149,7 +159,8 @@ def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
         tol=tol,
         random_state=seed,
         mask=mask,
-        verbose=False,
+        init="random",
+        verbose=True,
     )
 
 

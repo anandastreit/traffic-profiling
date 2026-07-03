@@ -69,4 +69,9 @@ htmlcov/
 python/data/raw/**/*
 python/data/daily/**/*
 python/data/output/**/*
+python/data/output_tol1e6/**/*
+python/data/output_tol1e8/**/*
 !**/.gitkeep
+
+# matlab/data — large exported files (loadings_all.csv ~418MB, already covered by *.csv)
+matlab/data/
