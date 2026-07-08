@@ -41,7 +41,7 @@ from scipy.optimize import linear_sum_assignment
 _HERE = os.path.dirname(os.path.abspath(__file__))
 LOADINGS_CSV = os.path.join(_HERE, "..", "matlab", "data", "loadings_all.csv")
 PER_WEEK_DIR = os.path.join(_HERE, "data", "output", "per_week")
-ALL_DAYS_DIR = os.path.join(_HERE, "data", "output_tol1e6", "all_days")
+ALL_DAYS_DIR = os.path.join(_HERE, "data", "output_tol1e8", "all_days")
 
 TRAINING_SOURCE = "2019-08-19_2019-09-22"
 N_COMP = 5
@@ -57,14 +57,14 @@ WEEK_MAP = {
 
 
 def tcc_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Cosine similarity between each pair of columns of a and b (shape m×k)."""
+    """Cosine similarity between each column pair of a and b (shape m×k)."""
     a_n = a / np.linalg.norm(a, axis=0, keepdims=True)
     b_n = b / np.linalg.norm(b, axis=0, keepdims=True)
     return a_n.T @ b_n  # (k×k)
 
 
 def best_alignment(tcc_mat: np.ndarray):
-    """Hungarian algorithm: find column permutation that maximises sum of TCC."""
+    """Hungarian algorithm: column permutation maximising sum of TCC."""
     row_ind, col_ind = linear_sum_assignment(-tcc_mat)
     return row_ind, col_ind, tcc_mat[row_ind, col_ind]
 
@@ -93,7 +93,9 @@ def _report(label: str, mat: np.ndarray, py: np.ndarray):
     )
 
 
-def _load_matlab(df: pd.DataFrame, type_: str, week: str, mode: str) -> np.ndarray:
+def _load_matlab(
+    df: pd.DataFrame, type_: str, week: str, mode: str
+) -> np.ndarray:
     subset = df[
         (df["source"] == TRAINING_SOURCE)
         & (df["type"] == type_)
