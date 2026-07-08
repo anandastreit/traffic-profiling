@@ -31,13 +31,14 @@ env/
 *.npy
 *.joblib
 
-# Figures / reports
+# Figures / reports — ignore everywhere except python/figures/
 *.png
 *.jpg
 *.jpeg
 *.svg
 *.gif
 *.pdf
+!python/figures/*.png
 
 # Logs / temp / R history
 logs/

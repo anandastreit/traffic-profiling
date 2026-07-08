@@ -139,29 +139,57 @@ def build_week_tensor(ids_down: pd.DataFrame, data_down: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
-                tol: float = TOLERANCE, seed: int = SEED):
+                tol: float = TOLERANCE, seed: int = SEED,
+                checkpoint_fn=None, checkpoint_every: int = 500):
     """
     Non-negative PARAFAC on a 3D tensor X[n_ud, 1440, 2].
 
-    NaN entries (missing minutes within a UD pair) are excluded from ALS
-    updates via a boolean mask, matching MATLAB N-way toolbox behavior.
+    NaN entries are zeroed out and excluded from updates via a float mask
+    (PyTorch does not support bool tensor arithmetic).
+
+    If checkpoint_fn is provided, runs in chunks of checkpoint_every iterations
+    and calls checkpoint_fn(cp) after each chunk — useful for long runs so
+    results are available mid-training without waiting for full convergence.
     """
     nan_mask = np.isnan(X)
     tensor = tl.tensor(np.nan_to_num(X, nan=0.0))
     # Cast mask to float — PyTorch does not support arithmetic on bool tensors
     mask = tl.tensor((~nan_mask).astype(float)) if nan_mask.any() else None
-    # SVD init tries to compute full SVD of the mode-2 unfolding (shape 2 × n_ud*1440),
-    # which requires a (n_ud*1440 × n_ud*1440) matrix — infeasible on real data.
-    return non_negative_parafac(
-        tensor,
-        rank=n_components,
-        n_iter_max=10000,
-        tol=tol,
-        random_state=seed,
-        mask=mask,
-        init="random",
-        verbose=True,
-    )
+
+    if checkpoint_fn is None:
+        return non_negative_parafac(
+            tensor,
+            rank=n_components,
+            n_iter_max=10000,
+            tol=tol,
+            random_state=seed,
+            mask=mask,
+            init="random",
+            verbose=True,
+        )
+
+    # Chunked mode: run checkpoint_every iterations at a time, save after each.
+    cp = None
+    total_iters = 0
+    while True:
+        cp, rec_errors = non_negative_parafac(
+            tensor,
+            rank=n_components,
+            n_iter_max=checkpoint_every,
+            tol=tol,
+            random_state=seed if total_iters == 0 else None,
+            mask=mask,
+            init="random" if total_iters == 0 else cp,
+            verbose=True,
+            return_errors=True,
+        )
+        total_iters += len(rec_errors)
+        print(f"  [checkpoint @ ~{total_iters} iters] saving...")
+        checkpoint_fn(cp)
+        if len(rec_errors) < checkpoint_every:
+            print(f"  Converged.")
+            break
+    return cp
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +251,8 @@ def train_per_week(output_base: str, n_components: int, tol: float):
         save_model(cp, label, ids_ud, os.path.join(output_base, "per_week", label))
 
 
-def train_all_days(output_base: str, n_components: int, tol: float):
+def train_all_days(output_base: str, n_components: int, tol: float,
+                   checkpoint_every: int = 0):
     """One PARAFAC model on all weeks combined (UD pairs concatenated)."""
     down_files, up_files = _get_file_pairs()
 
@@ -239,11 +268,19 @@ def train_all_days(output_base: str, n_components: int, tol: float):
     X_all = np.concatenate(all_X, axis=0)
     ids_all = pd.concat(all_ids, ignore_index=True).drop_duplicates().reset_index(drop=True)
 
+    out_dir = os.path.join(output_base, "all_days")
     print(f"\n=== Fitting PARAFAC on full tensor {X_all.shape} "
           f"(rank={n_components}, tol={tol}) ===")
-    cp = run_parafac(X_all, n_components=n_components, tol=tol)
 
-    save_model(cp, "all_days", ids_all, os.path.join(output_base, "all_days"))
+    checkpoint_fn = None
+    if checkpoint_every > 0:
+        def checkpoint_fn(cp):
+            save_model(cp, "all_days", ids_all, out_dir)
+
+    cp = run_parafac(X_all, n_components=n_components, tol=tol,
+                     checkpoint_fn=checkpoint_fn, checkpoint_every=checkpoint_every or 500)
+
+    save_model(cp, "all_days", ids_all, out_dir)
     print("Done.")
 
 
@@ -271,6 +308,10 @@ def main():
         "--output", default=OUTPUT_DIR,
         help=f"Base output directory (default: {OUTPUT_DIR})",
     )
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=0, metavar="N",
+        help="Save factors every N iterations (0 = disabled, only save at convergence)",
+    )
     args = parser.parse_args()
 
     if args.mode in ("per_week", "both"):
@@ -279,7 +320,8 @@ def main():
 
     if args.mode in ("all_days", "both"):
         print("\n====== ALL-DAYS MODEL ======")
-        train_all_days(args.output, args.components, args.tol)
+        train_all_days(args.output, args.components, args.tol,
+                       checkpoint_every=args.checkpoint_every)
 
 
 if __name__ == "__main__":
