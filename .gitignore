@@ -9,6 +9,8 @@ build/
 
 # Environments
 .env
+.secrets.env
+**/.secrets.env
 .venv/
 venv/
 env/
@@ -41,13 +43,16 @@ env/
 !python/figures/*.png
 
 # Logs / temp / R history
-logs/
 *.log
 *.tmp
 *.save
 .Rhistory
 output_down.txt
 output_up.txt
+# Log CSVs / reports may contain internal aggregate data — ignore
+**/logs/*.csv
+**/logs/*.log
+**/logs/*.html
 
 # Tool caches
 .mypy_cache/
@@ -72,7 +77,12 @@ python/data/daily/**/*
 python/data/output/**/*
 python/data/output_tol1e6/**/*
 python/data/output_tol1e8/**/*
+!python/data/raw/wan_metrics/README.md
 !**/.gitkeep
 
 # matlab/data — large exported files (loadings_all.csv ~418MB, already covered by *.csv)
 matlab/data/
+
+# Old MATLAB/Python research dirs — local reference only, never committed
+/SUESTE/
+/SUESTE_OLD/
