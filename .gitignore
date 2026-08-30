@@ -77,6 +77,8 @@ python/data/daily/**/*
 python/data/output/**/*
 python/data/output_tol1e6/**/*
 python/data/output_tol1e8/**/*
+python/data/input_wan/**/*
+python/data/output_wan/**/*
 !python/data/raw/wan_metrics/README.md
 !**/.gitkeep
 

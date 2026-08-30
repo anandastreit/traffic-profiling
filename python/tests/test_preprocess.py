@@ -13,12 +13,15 @@ from preprocess import (
     _DAILY_PREFIX,
     _compute_max_consec_nan,
     _iso_week_label,
+    _iso_week_sunday,
     _load_selection,
     _passes_filter,
     _round_to_minute,
     align,
+    align_wan,
     compute_stats,
     filter_series,
+    wan_filter,
 )
 
 
@@ -136,6 +139,195 @@ def test_iso_week_label_year_boundary():
 def test_iso_week_label_monday():
     # 2018-10-15 is a Monday (start of week 42)
     assert _iso_week_label("2018-10-15") == "2018-W42"
+
+
+# ---------------------------------------------------------------------------
+# _iso_week_sunday
+# ---------------------------------------------------------------------------
+
+def test_iso_week_sunday_regular():
+    # ISO week 34 of 2026 ends Sunday 2026-08-23
+    assert _iso_week_sunday("2026-W34") == datetime(2026, 8, 23).date()
+
+
+def test_iso_week_sunday_year_boundary():
+    # ISO week 1 of 2019 ends Sunday 2019-01-06
+    assert _iso_week_sunday("2019-W01") == datetime(2019, 1, 6).date()
+
+
+# ---------------------------------------------------------------------------
+# wan_filter — complete-week guard, stale-file cleanup, interior gaps
+# ---------------------------------------------------------------------------
+
+def _write_wan_daily(daily_dir, date_str, hostids=("h1",), minutes=1440):
+    """One aligned-WAN daily file: `minutes` full rows per host (enough to
+    pass _passes_filter when minutes > MAX_TOTAL_NAN)."""
+    rows = []
+    for h in hostids:
+        for i in range(minutes):
+            hh, mm = divmod(i, 60)
+            rows.append(
+                {
+                    "hostid": h,
+                    "str_date_hour": f"{date_str} {hh:02d}:{mm:02d}",
+                    "bytes_up_dif": 1000.0,
+                    "bytes_down_dif": 2000.0,
+                }
+            )
+    pd.DataFrame(rows).to_csv(
+        daily_dir / f"wan_metrics_{date_str}.csv", index=False
+    )
+
+
+@pytest.fixture
+def wan_filter_setup(tmp_path, monkeypatch):
+    import preprocess
+    daily_dir = tmp_path / "daily" / "wan_metrics"
+    daily_dir.mkdir(parents=True)
+    monkeypatch.setattr(preprocess, "WAN_DAILY_DIR", daily_dir)
+    monkeypatch.setattr(preprocess, "WAN_INPUT_DIR", tmp_path / "input_wan")
+    return daily_dir, tmp_path / "input_wan"
+
+
+def test_wan_filter_skips_in_progress_week(wan_filter_setup):
+    daily_dir, input_dir = wan_filter_setup
+    # Full ISO week 34 (Mon 08-17 .. Sun 08-23) + a partial week 35 (Mon, Tue).
+    for d in range(17, 24):
+        _write_wan_daily(daily_dir, f"2026-08-{d:02d}")
+    _write_wan_daily(daily_dir, "2026-08-24")
+    _write_wan_daily(daily_dir, "2026-08-25")
+
+    wan_filter()
+
+    down = sorted(p.name for p in (input_dir / "down").glob("*.csv"))
+    assert down == ["series_wan_filtered_2026-08-17_2026-08-23.csv"]
+    # week 35 (Sunday 2026-08-30) is in-progress -> not written
+    assert not list((input_dir / "down").glob("*2026-08-24*"))
+
+
+def test_wan_filter_removes_stale_output(wan_filter_setup):
+    daily_dir, input_dir = wan_filter_setup
+    for d in range(17, 24):
+        _write_wan_daily(daily_dir, f"2026-08-{d:02d}")
+    stale = input_dir / "down"
+    stale.mkdir(parents=True)
+    (stale / "series_wan_filtered_2019-01-01_2019-01-07.csv").write_text("old")
+
+    wan_filter()
+
+    names = sorted(p.name for p in stale.glob("*.csv"))
+    assert names == ["series_wan_filtered_2026-08-17_2026-08-23.csv"]
+
+
+def test_wan_filter_keeps_past_week_with_interior_gap(wan_filter_setup):
+    daily_dir, input_dir = wan_filter_setup
+    # ISO week 34, but Wednesday 08-19 is a header-only (empty) daily file,
+    # mimicking a real source outage. The week is still calendar-complete.
+    for d in range(17, 24):
+        if d == 19:
+            pd.DataFrame(
+                columns=["hostid", "str_date_hour", "bytes_up_dif", "bytes_down_dif"]
+            ).to_csv(daily_dir / f"wan_metrics_2026-08-{d:02d}.csv", index=False)
+        else:
+            _write_wan_daily(daily_dir, f"2026-08-{d:02d}")
+    # a later full week so last_data_day is well past week 34
+    for d in range(24, 31):
+        _write_wan_daily(daily_dir, f"2026-08-{d:02d}")
+
+    wan_filter()
+
+    out = pd.read_csv(
+        input_dir / "down" / "series_wan_filtered_2026-08-17_2026-08-23.csv"
+    )
+    assert sorted(out["day"].unique()) == [
+        "2026-08-17", "2026-08-18", "2026-08-20",
+        "2026-08-21", "2026-08-22", "2026-08-23",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# align_wan — incremental (--start-date) mode
+# ---------------------------------------------------------------------------
+
+def _write_wan_raw_utc(raw_dir, date_str, hostids=("aa:bb",)):
+    """One raw UTC wan_metrics file: every minute of the UTC day per host."""
+    stamps = pd.date_range(f"{date_str} 00:00", f"{date_str} 23:59", freq="1min")
+    rows = []
+    for h in hostids:
+        for t in stamps:
+            rows.append(
+                {
+                    "hostid": h,
+                    "timestamp": t.strftime("%Y-%m-%d %H:%M:%S"),
+                    "bytes_up_dif": 100.0,
+                    "bytes_down_dif": 200.0,
+                    "packets_up_dif": 1.0,
+                    "packets_down_dif": 2.0,
+                }
+            )
+    pd.DataFrame(rows).to_csv(
+        raw_dir / f"wan_metrics_{date_str}.csv", index=False
+    )
+
+
+@pytest.fixture
+def align_wan_setup(tmp_path, monkeypatch):
+    import preprocess
+    raw_dir = tmp_path / "raw" / "wan_metrics"
+    raw_dir.mkdir(parents=True)
+    daily_dir = tmp_path / "daily" / "wan_metrics"
+    daily_dir.mkdir(parents=True)
+    monkeypatch.setattr(preprocess, "RAW_DIR", tmp_path / "raw")
+    monkeypatch.setattr(preprocess, "WAN_DAILY_DIR", daily_dir)
+    return raw_dir, daily_dir
+
+
+def test_align_wan_incremental_leaves_earlier_days_untouched(align_wan_setup):
+    raw_dir, daily_dir = align_wan_setup
+    for d in ("2026-05-10", "2026-05-11", "2026-05-12", "2026-05-13"):
+        _write_wan_raw_utc(raw_dir, d)
+
+    # Pre-place a sentinel where an earlier local day's file would be.
+    sentinel = daily_dir / "wan_metrics_2026-05-10.csv"
+    sentinel.write_text("SENTINEL")
+
+    # Rebuild only local days >= 2026-05-12.
+    align_wan(min_samples=720, start_date="2026-05-12")
+
+    # Earlier day: untouched.
+    assert sentinel.read_text() == "SENTINEL"
+    # Boundary throwaway day (2026-05-11) not written.
+    assert not (daily_dir / "wan_metrics_2026-05-11.csv").exists()
+    # Target day: rebuilt with real data.
+    got = pd.read_csv(daily_dir / "wan_metrics_2026-05-12.csv")
+    assert "aa:bb" in set(got["hostid"])
+    assert len(got) == NUM_MINUTES  # full local day
+
+
+def test_align_wan_incremental_matches_full_run_for_kept_days(align_wan_setup):
+    raw_dir, daily_dir = align_wan_setup
+    for d in ("2026-05-10", "2026-05-11", "2026-05-12", "2026-05-13"):
+        _write_wan_raw_utc(raw_dir, d)
+
+    align_wan(min_samples=720)
+    full = pd.read_csv(daily_dir / "wan_metrics_2026-05-12.csv").sort_values(
+        ["hostid", "str_date_hour"]
+    ).reset_index(drop=True)
+
+    (daily_dir / "wan_metrics_2026-05-12.csv").unlink()
+    align_wan(min_samples=720, start_date="2026-05-12")
+    incr = pd.read_csv(daily_dir / "wan_metrics_2026-05-12.csv").sort_values(
+        ["hostid", "str_date_hour"]
+    ).reset_index(drop=True)
+
+    pd.testing.assert_frame_equal(full, incr)
+
+
+def test_align_wan_incremental_no_files_in_range_raises(align_wan_setup):
+    raw_dir, _ = align_wan_setup
+    _write_wan_raw_utc(raw_dir, "2026-05-10")
+    with pytest.raises(FileNotFoundError):
+        align_wan(min_samples=720, start_date="2026-06-01")
 
 
 # ---------------------------------------------------------------------------

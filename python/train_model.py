@@ -187,7 +187,7 @@ def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
         print(f"  [checkpoint @ ~{total_iters} iters] saving...")
         checkpoint_fn(cp)
         if len(rec_errors) < checkpoint_every:
-            print(f"  Converged.")
+            print("  Converged.")
             break
     return cp
 
@@ -223,11 +223,11 @@ def _load_week_pair(down_path: str, up_path: str):
     return build_week_tensor(ids_down, data_down, ids_up, data_up)
 
 
-def _get_file_pairs():
-    down_files = sorted(glob.glob(os.path.join(DOWN_DIR, "*.csv")))
-    up_files = sorted(glob.glob(os.path.join(UP_DIR, "*.csv")))
+def _get_file_pairs(down_dir: str, up_dir: str):
+    down_files = sorted(glob.glob(os.path.join(down_dir, "*.csv")))
+    up_files = sorted(glob.glob(os.path.join(up_dir, "*.csv")))
     if not down_files:
-        raise FileNotFoundError(f"No CSV files found in {DOWN_DIR}")
+        raise FileNotFoundError(f"No CSV files found in {down_dir}")
     if len(down_files) != len(up_files):
         raise ValueError(
             f"Mismatch: {len(down_files)} down files vs {len(up_files)} up files"
@@ -235,9 +235,10 @@ def _get_file_pairs():
     return down_files, up_files
 
 
-def train_per_week(output_base: str, n_components: int, tol: float):
+def train_per_week(output_base: str, n_components: int, tol: float,
+                   down_dir: str = None, up_dir: str = None):
     """One independent PARAFAC model per week."""
-    down_files, up_files = _get_file_pairs()
+    down_files, up_files = _get_file_pairs(down_dir or DOWN_DIR, up_dir or UP_DIR)
 
     for week_num, (down_path, up_path) in enumerate(zip(down_files, up_files), start=1):
         label = f"week{week_num:02d}"
@@ -252,9 +253,10 @@ def train_per_week(output_base: str, n_components: int, tol: float):
 
 
 def train_all_days(output_base: str, n_components: int, tol: float,
-                   checkpoint_every: int = 0):
+                   checkpoint_every: int = 0,
+                   down_dir: str = None, up_dir: str = None):
     """One PARAFAC model on all weeks combined (UD pairs concatenated)."""
-    down_files, up_files = _get_file_pairs()
+    down_files, up_files = _get_file_pairs(down_dir or DOWN_DIR, up_dir or UP_DIR)
 
     all_X = []
     all_ids = []
@@ -274,8 +276,9 @@ def train_all_days(output_base: str, n_components: int, tol: float,
 
     checkpoint_fn = None
     if checkpoint_every > 0:
-        def checkpoint_fn(cp):
+        def _save_checkpoint(cp):
             save_model(cp, "all_days", ids_all, out_dir)
+        checkpoint_fn = _save_checkpoint
 
     cp = run_parafac(X_all, n_components=n_components, tol=tol,
                      checkpoint_fn=checkpoint_fn, checkpoint_every=checkpoint_every or 500)
@@ -309,6 +312,14 @@ def main():
         help=f"Base output directory (default: {OUTPUT_DIR})",
     )
     parser.add_argument(
+        "--down-dir", default=DOWN_DIR,
+        help=f"Directory with weekly download CSVs (default: {DOWN_DIR})",
+    )
+    parser.add_argument(
+        "--up-dir", default=UP_DIR,
+        help=f"Directory with weekly upload CSVs (default: {UP_DIR})",
+    )
+    parser.add_argument(
         "--checkpoint-every", type=int, default=0, metavar="N",
         help="Save factors every N iterations (0 = disabled, only save at convergence)",
     )
@@ -316,12 +327,14 @@ def main():
 
     if args.mode in ("per_week", "both"):
         print("\n====== PER-WEEK MODELS ======")
-        train_per_week(args.output, args.components, args.tol)
+        train_per_week(args.output, args.components, args.tol,
+                       down_dir=args.down_dir, up_dir=args.up_dir)
 
     if args.mode in ("all_days", "both"):
         print("\n====== ALL-DAYS MODEL ======")
         train_all_days(args.output, args.components, args.tol,
-                       checkpoint_every=args.checkpoint_every)
+                       checkpoint_every=args.checkpoint_every,
+                       down_dir=args.down_dir, up_dir=args.up_dir)
 
 
 if __name__ == "__main__":

@@ -4,13 +4,20 @@ Preprocessing pipeline for PARAFAC traffic model.
 Ports SUESTE_OLD preprocessing (mix of Python 2 + R) to a single Python 3 script.
 
 Stages (run in order):
-  1  extract  raw measurements → per-direction traffic CSVs       [stub — TBD]
-  2  align    raw CSVs → daily 1440-minute series per user
-  3  stats    daily series → NaN statistics (info only)
-  4  filter   daily series → filtered weekly CSVs for train_model.py
-  all          runs stages 2 + 3 + 4
+  1   extract     raw measurements (DB) → per-day traffic CSVs
+  1b  align_wan   raw wan_metrics CSVs (UTC) → daily 1440-minute long-format
+                  CSVs (São Paulo local time), one row per hostid x minute
+  1c  wan_filter  aligned WAN daily files → filtered weekly wide CSVs
+                  (bytes_down_dif / bytes_up_dif only) for train_model.py
+  2   align       raw CSVs → daily 1440-minute series per user
+  3   stats       daily series → NaN statistics (info only)
+  4   filter      daily series → filtered weekly CSVs for train_model.py
+  all             runs stages 2 + 3 + 4
 
 Usage:
+  python preprocess.py align_wan   --measure up --min-samples 720
+  python preprocess.py align_wan   --measure up --start-date 2026-08-04  # incremental top-up
+  python preprocess.py wan_filter  --measure up
   python preprocess.py align   --measure down
   python preprocess.py filter  --measure down
   python preprocess.py stats   --measure down
@@ -27,7 +34,7 @@ Raw CSV expected columns: hostid (or mac) | timestamp (epoch or datetime) | traf
 """
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import os
 from pathlib import Path
 import shlex
@@ -59,9 +66,15 @@ _DAILY_PREFIX = "series_giga_"
 _10MIN_PREFIX = "series_giga_10_"
 
 WAN_DAILY_DIR = DATA_DIR / "daily" / "wan_metrics"
+WAN_INPUT_DIR = DATA_DIR / "input_wan"
 _WAN_TZ = "America/Sao_Paulo"
 _WAN_DIF_COLS = ["bytes_up_dif", "bytes_down_dif", "packets_up_dif", "packets_down_dif"]
 _WAN_MIN_SAMPLES_DEFAULT = 720  # 50% of 1440 minutes
+_WAN_DIRECTION_METRIC = {"down": "bytes_down_dif", "up": "bytes_up_dif"}
+# 20 GB in one ~1-minute bucket (~2.67 Gbps sustained) — comfortably above the
+# 99.99th percentile of observed legitimate traffic (~2 GB/min); values above
+# this are counter-read glitches, not real traffic. See align_wan.
+_WAN_MAX_BYTES_PER_MIN = 2e10
 
 
 def _load_env_file(env_file: str | None, override: bool = True):
@@ -319,14 +332,16 @@ def extract_from_db(
 # Stage 1b: align_wan — port of SUESTE data_processing/filter_module pipeline
 # ---------------------------------------------------------------------------
 
-def _align_wan_one_file(raw_csv: Path) -> pd.DataFrame:
+def _align_wan_one_file(raw_csv: Path) -> tuple[pd.DataFrame, int]:
     """
     Read one raw wan_metrics UTC CSV, convert to local time (America/Sao_Paulo),
     truncate to minute, and return mean per (hostid, minute_local) — identical
     to mean_duplicates() in the SUESTE 2021 pipeline.
 
-    Returns a DataFrame with columns:
-        hostid | str_date_hour (YYYY-MM-DD HH:MM, local) | <_dif metrics>
+    Returns:
+        df        DataFrame with columns hostid | str_date_hour (YYYY-MM-DD
+                  HH:MM, local) | <_dif metrics>
+        n_capped  count of counter-diff readings masked by the outlier cap
     """
     df = pd.read_csv(raw_csv)
 
@@ -344,17 +359,30 @@ def _align_wan_one_file(raw_csv: Path) -> pd.DataFrame:
     ]
     df = df[keep_cols]
 
-    # mean_duplicates: same as SUESTE — mean per (hostid, minute_local)
+    # Outlier cap: a single corrupted counter read (e.g. a momentary bad SNMP
+    # poll) produces a spuriously huge NEXT-sample diff — the extract SQL's
+    # "diff < 0 -> NULL" only catches the corrupted sample itself, not the
+    # inflated diff on the sample right after it. Mask any diff implausibly
+    # large for a ~1-minute window (default cap comfortably above observed
+    # legitimate traffic, see _WAN_MAX_BYTES_PER_MIN).
     agg_cols = [c for c in _WAN_DIF_COLS if c in df.columns]
+    n_capped = 0
+    for col in agg_cols:
+        outliers = df[col] > _WAN_MAX_BYTES_PER_MIN
+        n_capped += int(outliers.sum())
+        df.loc[outliers, col] = np.nan
+
+    # mean_duplicates: same as SUESTE — mean per (hostid, minute_local)
     df = (
         df.sort_values(["hostid", "str_date_hour"])
         .groupby(["hostid", "str_date", "str_date_hour"], as_index=False)[agg_cols]
         .mean(numeric_only=True)
     )
-    return df
+    return df, n_capped
 
 
-def align_wan(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT):
+def align_wan(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT,
+              start_date: str | None = None):
     """
     Stage 1b: align WAN all-metrics raw CSVs to local-time daily files.
 
@@ -371,15 +399,35 @@ def align_wan(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT):
     min_samples: minimum number of valid minute-rows per (hostid, day).
                  Default 720 = 50% of 1440 minutes (same threshold as
                  filter_series MAX_TOTAL_NAN for the classic pipeline).
+
+    start_date: incremental mode. If given (YYYY-MM-DD), only local days
+                >= start_date are rebuilt. UTC files before start_date are
+                skipped; the first kept UTC file still spills its first ~3h
+                into local day (start_date - 1), but that partial day is
+                discarded rather than written, so its existing daily file is
+                left intact. Local day start_date needs the UTC file for
+                start_date + 1 to be complete — make sure it was extracted.
+                Use this for cheap top-ups after extending the extraction.
     """
     raw_dir = RAW_DIR / "wan_metrics"
     raw_files = sorted(raw_dir.glob("wan_metrics_*.csv"))
     if not raw_files:
         raise FileNotFoundError(f"No wan_metrics CSVs found in {raw_dir}")
 
+    if start_date:
+        raw_files = [
+            f for f in raw_files
+            if f.stem.replace("wan_metrics_", "") >= start_date
+        ]
+        if not raw_files:
+            raise FileNotFoundError(
+                f"No wan_metrics CSVs on/after {start_date} in {raw_dir}"
+            )
+
     WAN_DAILY_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"=== Stage 1b: align_wan — {len(raw_files)} UTC file(s), "
+    scope = f", local days >= {start_date}" if start_date else ""
+    print(f"=== Stage 1b: align_wan — {len(raw_files)} UTC file(s){scope}, "
           f"min_samples={min_samples} ===")
 
     # Rolling buffer: accumulate partial local-day DataFrames across UTC files.
@@ -389,6 +437,12 @@ def align_wan(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT):
 
     def _flush_day(local_date: str):
         """Merge, filter, and write one complete local day."""
+        if start_date and local_date < start_date:
+            # Throwaway boundary day: the first kept UTC file spills into it,
+            # but we never processed the UTC file that owns its bulk. Drop it
+            # so the existing daily file is not overwritten with partial data.
+            day_buffer.pop(local_date, None)
+            return
         parts = day_buffer.pop(local_date, [])
         if not parts:
             print(f"  {local_date}: no data — skipped")
@@ -415,9 +469,11 @@ def align_wan(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT):
         print(f"  {local_date}: {after} routers ({before - after} dropped, "
               f"{len(day_df)} rows) -> {out_path.name}")
 
+    total_capped = 0
     for i, raw_csv in enumerate(raw_files):
         utc_date = raw_csv.stem.replace("wan_metrics_", "")  # YYYY-MM-DD (UTC)
-        df = _align_wan_one_file(raw_csv)
+        df, n_capped = _align_wan_one_file(raw_csv)
+        total_capped += n_capped
 
         # Distribute rows into per-local-date buckets
         for local_date, chunk in df.groupby("str_date"):
@@ -432,6 +488,98 @@ def align_wan(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT):
     # Flush remaining days (the last UTC file's local dates)
     for local_date in sorted(day_buffer.keys()):
         _flush_day(local_date)
+
+    print(f"Capped {total_capped} counter-diff outlier reading(s) "
+          f"(> {_WAN_MAX_BYTES_PER_MIN:.0e} bytes/min).")
+    print("Done.\n")
+
+
+# ---------------------------------------------------------------------------
+# Stage 1c: wan_filter — pivot aligned WAN daily files into weekly wide CSVs
+# ---------------------------------------------------------------------------
+
+def _wan_day_to_wide(day_df: pd.DataFrame, metric_col: str) -> pd.DataFrame:
+    """Pivot one day's long-format WAN rows (hostid x minute) into a wide
+    1440-minute row per hostid. Missing minutes become NaN columns."""
+    minute = day_df["str_date_hour"].str.slice(-5)
+    wide = day_df.assign(minute=minute).pivot_table(
+        index="hostid", columns="minute", values=metric_col, aggfunc="mean"
+    )
+    return wide.reindex(columns=_MINUTE_COLS)
+
+
+def _iso_week_sunday(week_label: str) -> date:
+    """'2026-W34' -> date of that ISO week's Sunday (ISO weekday 7)."""
+    iso_year, iso_week = int(week_label[:4]), int(week_label[6:])
+    return date.fromisocalendar(iso_year, iso_week, 7)
+
+
+def wan_filter(min_samples: int = _WAN_MIN_SAMPLES_DEFAULT):
+    """
+    Stage 1c: pivot data/daily/wan_metrics/ (long format, one row per
+    hostid x minute) into weekly wide CSVs matching the schema filter_series
+    produces (user | day | 00:00 ... 23:59), so train_model.py can read them
+    unmodified via --down-dir/--up-dir data/input_wan/{down,up}.
+
+    Only bytes_down_dif / bytes_up_dif are used — packets are dropped.
+    Applies the same quality filter as filter_series (<=180 consecutive NaN,
+    <720 total NaN per router per day). Weeks are grouped by ISO calendar week.
+
+    Resumability: this is a full rebuild. data/input_wan/{down,up}/ is cleared
+    first, so re-running after extending the extraction never leaves stale
+    weekly files behind. Only ISO weeks whose Sunday is <= the last local day
+    with data are written — the current, still-in-progress week is skipped so
+    it can't land as a short file that later grows under a different name.
+    Past weeks with interior gaps (real source outages) are still written with
+    whatever days they have.
+
+    min_samples is accepted for symmetry with align_wan but is not applied
+    here — the per-day minimum-samples filter already ran in align_wan.
+    """
+    day_files = sorted(WAN_DAILY_DIR.glob("wan_metrics_*.csv"))
+    if not day_files:
+        raise FileNotFoundError(f"No daily WAN files found in {WAN_DAILY_DIR}")
+
+    print(f"=== Stage 1c: wan_filter — {len(day_files)} day(s) ===")
+
+    weeks: dict[str, dict[str, list[pd.DataFrame]]] = {"down": {}, "up": {}}
+    last_data_day: date | None = None
+
+    for f in day_files:
+        date_str = f.stem.replace("wan_metrics_", "")
+        raw = pd.read_csv(f)
+        week_label = _iso_week_label(date_str)
+        if not raw.empty:
+            d = date.fromisoformat(date_str)
+            last_data_day = d if last_data_day is None else max(last_data_day, d)
+
+        for direction, metric_col in _WAN_DIRECTION_METRIC.items():
+            wide = _wan_day_to_wide(raw, metric_col)
+            wide = wide.reset_index().rename(columns={"hostid": "user"})
+            wide.insert(1, "day", date_str)
+            wide = wide[_COL_NAMES]
+
+            before = len(wide)
+            passing = wide[wide.apply(_passes_filter, axis=1)].reset_index(drop=True)
+            print(f"  {date_str} [{direction}]: {before} -> {len(passing)} routers")
+            weeks[direction].setdefault(week_label, []).append(passing)
+
+    for direction in ("down", "up"):
+        out_dir = WAN_INPUT_DIR / direction
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for stale in out_dir.glob("series_wan_filtered_*.csv"):
+            stale.unlink()
+        for week_label, frames in sorted(weeks[direction].items()):
+            if last_data_day is None or _iso_week_sunday(week_label) > last_data_day:
+                print(f"  => [{direction}] {week_label}: in-progress week — skipped")
+                continue
+            week_df = pd.concat(frames, ignore_index=True)
+            if week_df.empty:
+                continue
+            days = sorted(week_df["day"].unique())
+            out_path = out_dir / f"series_wan_filtered_{days[0]}_{days[-1]}.csv"
+            week_df.to_csv(out_path, index=False)
+            print(f"  => [{direction}] {out_path.name} ({len(week_df)} rows, {len(days)} days)")
 
     print("Done.\n")
 
@@ -674,7 +822,7 @@ def main():
     )
     parser.add_argument(
         "stage",
-        choices=["extract", "align_wan", "align", "stats", "filter", "all"],
+        choices=["extract", "align_wan", "wan_filter", "align", "stats", "filter", "all"],
     )
     parser.add_argument(
         "--secrets-file",
@@ -691,7 +839,9 @@ def main():
     )
     parser.add_argument(
         "--start-date", default=None,
-        help="Start date (YYYY-MM-DD), inclusive. Used with --end-date.",
+        help="Start date (YYYY-MM-DD), inclusive. With 'extract', paired with "
+             "--end-date to set the query range. With 'align_wan', enables "
+             "incremental mode: only local days >= this date are rebuilt.",
     )
     parser.add_argument(
         "--end-date", default=None,
@@ -744,8 +894,11 @@ def main():
                 db_password_env=args.db_password_env,
             )
         elif args.stage == "align_wan":
-            align_wan(min_samples=args.min_samples)
+            align_wan(min_samples=args.min_samples, start_date=args.start_date)
             break  # align_wan is not per-measure
+        elif args.stage == "wan_filter":
+            wan_filter(min_samples=args.min_samples)
+            break  # wan_filter is not per-measure
         elif args.stage == "align":
             align(measure)
         elif args.stage == "stats":
