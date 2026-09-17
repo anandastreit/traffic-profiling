@@ -82,6 +82,8 @@ python/data/output_wan/**/*
 python/data/exploratory/**/*
 !python/data/raw/wan_metrics/README.md
 !**/.gitkeep
+!python/data/exploratory/**/
+!python/data/exploratory/**/*.py
 
 # matlab/data — large exported files (loadings_all.csv ~418MB, already covered by *.csv)
 matlab/data/
