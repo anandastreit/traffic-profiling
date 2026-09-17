@@ -11,6 +11,7 @@ from train_model import (
     nlog10,
     nlog10_inverse,
     run_parafac,
+    save_convergence,
     save_model,
     train_per_week,
 )
@@ -149,7 +150,7 @@ def test_build_week_tensor_direction_alignment():
 
 def test_run_parafac_output_shape():
     X = np.random.default_rng(0).random((6, 10, 2))
-    cp = run_parafac(X, n_components=2, tol=1e-3, seed=42)
+    cp, rec_errors, converged = run_parafac(X, n_components=2, tol=1e-3, seed=42)
     assert len(cp.factors) == 3
     assert cp.factors[0].shape == (6, 2)
     assert cp.factors[1].shape == (10, 2)
@@ -158,7 +159,7 @@ def test_run_parafac_output_shape():
 
 def test_run_parafac_non_negative():
     X = np.random.default_rng(1).random((6, 10, 2))
-    cp = run_parafac(X, n_components=2, tol=1e-3, seed=42)
+    cp, rec_errors, converged = run_parafac(X, n_components=2, tol=1e-3, seed=42)
     for factor in cp.factors:
         assert (factor >= 0).all()
 
@@ -166,8 +167,58 @@ def test_run_parafac_non_negative():
 def test_run_parafac_with_nan():
     X = np.random.default_rng(2).random((6, 10, 2))
     X[0, 3:6, :] = np.nan
-    cp = run_parafac(X, n_components=2, tol=1e-3, seed=42)
+    cp, rec_errors, converged = run_parafac(X, n_components=2, tol=1e-3, seed=42)
     assert len(cp.factors) == 3
+
+
+def test_run_parafac_returns_convergence_trace():
+    # Loose tol on tiny random data converges in well under n_iter_max=10000 —
+    # exercises the "cp, rec_errors, converged" contract callers rely on to
+    # persist convergence instead of it only ever reaching stdout.
+    X = np.random.default_rng(3).random((6, 10, 2))
+    cp, rec_errors, converged = run_parafac(X, n_components=2, tol=1e-2, seed=42)
+    assert isinstance(rec_errors, list)
+    assert len(rec_errors) > 0
+    # Elements may be numpy/torch scalars depending on backend — what matters
+    # is they're numeric and JSON-serializable via float(), which is exactly
+    # what save_convergence relies on.
+    assert all(float(e) == float(e) for e in rec_errors)  # no NaN, no TypeError
+    assert converged is True
+    assert len(rec_errors) < 10000
+
+
+# ---------------------------------------------------------------------------
+# save_convergence
+# ---------------------------------------------------------------------------
+
+def test_save_convergence_converged(tmp_path):
+    save_convergence([1.0, 0.5, 0.31, 0.30], True, 1e-8, "week01", str(tmp_path))
+    path = tmp_path / "convergence_week01.json"
+    assert path.exists()
+    import json
+    info = json.loads(path.read_text())
+    assert info["converged"] is True
+    assert info["n_iter"] == 4
+    assert info["tol"] == 1e-8
+    assert info["final_error"] == 0.30
+    assert info["final_improvement"] == pytest.approx(0.01)
+    assert info["errors"] == [1.0, 0.5, 0.31, 0.30]
+
+
+def test_save_convergence_not_converged(tmp_path):
+    save_convergence([1.0, 0.9], False, 1e-8, "week02", str(tmp_path))
+    import json
+    info = json.loads((tmp_path / "convergence_week02.json").read_text())
+    assert info["converged"] is False
+
+
+def test_save_convergence_empty_errors(tmp_path):
+    save_convergence([], False, 1e-8, "week03", str(tmp_path))
+    import json
+    info = json.loads((tmp_path / "convergence_week03.json").read_text())
+    assert info["n_iter"] == 0
+    assert info["final_error"] is None
+    assert info["final_improvement"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -236,11 +287,17 @@ def test_train_per_week_end_to_end(tmp_path, monkeypatch):
     train_per_week(str(out_dir), n_components=2, tol=1e-2)
 
     week_dir = out_dir / "per_week" / "week01"
-    for fname in ["modeA_week01.csv", "modeB_week01.csv",
-                  "modeC_week01.csv", "ids_ud_week01.csv"]:
+    for fname in ["modeA_week01.csv", "modeB_week01.csv", "modeC_week01.csv",
+                  "ids_ud_week01.csv", "convergence_week01.json"]:
         assert (week_dir / fname).exists(), f"Missing: {fname}"
 
     assert pd.read_csv(week_dir / "modeA_week01.csv").shape == (4, 2)
     assert pd.read_csv(week_dir / "modeB_week01.csv").shape == (NUM_MINUTES, 2)
     assert pd.read_csv(week_dir / "modeC_week01.csv").shape == (2, 2)
     assert pd.read_csv(week_dir / "ids_ud_week01.csv").shape == (4, 2)
+
+    import json
+    conv = json.loads((week_dir / "convergence_week01.json").read_text())
+    assert conv["n_iter"] > 0
+    assert isinstance(conv["converged"], bool)
+    assert conv["tol"] == 1e-2

@@ -24,10 +24,11 @@ Output CSVs (written to data/output/<mode>/):
 Usage:
   python train_model.py per_week
   python train_model.py all_days
-  python train_model.py both --components 3 --tol 1e-10
+  python train_model.py both --components 5 --tol 1e-8
 """
 
 import argparse
+import json
 import os
 import glob
 
@@ -47,7 +48,10 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-NUM_COMP = 3
+# 5 components = the canonical "model5" reference (matlab/README.md, loadings_all.csv,
+# validate_matlab.py). The older SUESTE_OLD/gigalink-processed/*.m scripts used 3;
+# that line was superseded by the parafac_coronavirus model5. Override with --components.
+NUM_COMP = 5
 TOLERANCE = 1e-8
 SEED = 123
 NUM_MINUTES = 1440
@@ -150,6 +154,12 @@ def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
     If checkpoint_fn is provided, runs in chunks of checkpoint_every iterations
     and calls checkpoint_fn(cp) after each chunk — useful for long runs so
     results are available mid-training without waiting for full convergence.
+
+    Always returns (cp, rec_errors, converged) — rec_errors is the
+    per-iteration reconstruction-error trace tensorly recorded and converged
+    says whether the fit actually reached `tol` or was cut off by
+    n_iter_max, so callers can persist that instead of it only ever
+    reaching stdout (see save_convergence).
     """
     nan_mask = np.isnan(X)
     tensor = tl.tensor(np.nan_to_num(X, nan=0.0))
@@ -157,20 +167,26 @@ def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
     mask = tl.tensor((~nan_mask).astype(float)) if nan_mask.any() else None
 
     if checkpoint_fn is None:
-        return non_negative_parafac(
+        n_iter_max = 10000
+        cp, rec_errors = non_negative_parafac(
             tensor,
             rank=n_components,
-            n_iter_max=10000,
+            n_iter_max=n_iter_max,
             tol=tol,
             random_state=seed,
             mask=mask,
             init="random",
             verbose=True,
+            return_errors=True,
         )
+        return cp, list(rec_errors), len(rec_errors) < n_iter_max
 
     # Chunked mode: run checkpoint_every iterations at a time, save after each.
+    # No overall cap — the loop only exits once a chunk converges early, so
+    # this path always ends "converged" (unlike the single-shot path above).
     cp = None
     total_iters = 0
+    all_errors = []
     while True:
         cp, rec_errors = non_negative_parafac(
             tensor,
@@ -183,13 +199,14 @@ def run_parafac(X: np.ndarray, n_components: int = NUM_COMP,
             verbose=True,
             return_errors=True,
         )
+        all_errors.extend(rec_errors)
         total_iters += len(rec_errors)
         print(f"  [checkpoint @ ~{total_iters} iters] saving...")
         checkpoint_fn(cp)
         if len(rec_errors) < checkpoint_every:
             print("  Converged.")
             break
-    return cp
+    return cp, all_errors, True
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +227,35 @@ def save_model(cp, label: str, ids_ud: pd.DataFrame, output_dir: str):
     ids_path = os.path.join(output_dir, f"ids_ud_{label}.csv")
     ids_ud.to_csv(ids_path, index=False)
     print(f"  Saved: {ids_path}")
+
+
+def save_convergence(rec_errors, converged: bool, tol: float, label: str,
+                     output_dir: str):
+    """Persist the ALS convergence trace so it survives beyond stdout.
+
+    Without this, whether a fit actually reached `tol` or was cut off by
+    n_iter_max only ever existed as a `verbose=True` print statement — lost
+    once the terminal/log scrolled past it, and unreadable at all while the
+    process is still running and conda run is buffering stdout.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    info = {
+        "label": label,
+        "tol": tol,
+        "n_iter": len(rec_errors),
+        "converged": converged,
+        "final_error": float(rec_errors[-1]) if rec_errors else None,
+        "final_improvement": (
+            float(rec_errors[-2] - rec_errors[-1])
+            if len(rec_errors) >= 2 else None
+        ),
+        "errors": [float(e) for e in rec_errors],
+    }
+    path = os.path.join(output_dir, f"convergence_{label}.json")
+    with open(path, "w") as f:
+        json.dump(info, f)
+    status = "converged" if converged else "HIT n_iter_max — did not converge"
+    print(f"  Saved: {path}  ({len(rec_errors)} iters, {status})")
 
 
 # ---------------------------------------------------------------------------
@@ -247,9 +293,11 @@ def train_per_week(output_base: str, n_components: int, tol: float,
         X, ids_ud = _load_week_pair(down_path, up_path)
 
         print(f"  Fitting PARAFAC (rank={n_components}, tol={tol})...")
-        cp = run_parafac(X, n_components=n_components, tol=tol)
+        cp, rec_errors, converged = run_parafac(X, n_components=n_components, tol=tol)
 
-        save_model(cp, label, ids_ud, os.path.join(output_base, "per_week", label))
+        out_dir = os.path.join(output_base, "per_week", label)
+        save_model(cp, label, ids_ud, out_dir)
+        save_convergence(rec_errors, converged, tol, label, out_dir)
 
 
 def train_all_days(output_base: str, n_components: int, tol: float,
@@ -280,10 +328,12 @@ def train_all_days(output_base: str, n_components: int, tol: float,
             save_model(cp, "all_days", ids_all, out_dir)
         checkpoint_fn = _save_checkpoint
 
-    cp = run_parafac(X_all, n_components=n_components, tol=tol,
-                     checkpoint_fn=checkpoint_fn, checkpoint_every=checkpoint_every or 500)
+    cp, rec_errors, converged = run_parafac(
+        X_all, n_components=n_components, tol=tol,
+        checkpoint_fn=checkpoint_fn, checkpoint_every=checkpoint_every or 500)
 
     save_model(cp, "all_days", ids_all, out_dir)
+    save_convergence(rec_errors, converged, tol, "all_days", out_dir)
     print("Done.")
 
 
